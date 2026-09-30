@@ -1,0 +1,14 @@
+{
+  "datasets": {
+    "zroot/volume": {
+      "type": "Volume",
+      "properties": {
+        "volsize": "10M",
+        "volblocksize": 4096,
+        "compression": "zle"
+      }
+    }
+  },
+  "ignored_datasets": [],
+  "ignored_properties": []
+}
