@@ -1,6 +1,6 @@
 use crate::{
     prefix_paths::PrefixPaths,
-    property::{PropertySource, PropertyValue},
+    property::{DatasetType, PropertySource, PropertyValue},
     zfs_list_output::{SpecificationFilter, ZfsList},
     zfs_specification::{ZfsSpecification, ZfsSpecificationDataset},
 };
@@ -29,6 +29,8 @@ pub enum ZfsDiskoError {
     ZFSCommandFailed(#[source] std::io::Error),
     #[error("ZFS specification invalid")]
     InvalidSpec(#[source] serde_json::Error),
+    #[error("ZFS plan invalid:\n{0}")]
+    InvalidPlan(String),
     #[error("Couldn't write to stdout")]
     WriteStdoutFailed(#[source] std::io::Error),
     #[error("Couldn't serialize current ZFS specification to JSON")]
@@ -41,6 +43,7 @@ pub enum ZfsDiskoError {
 enum ZfsAction {
     CreateDataset {
         name: String,
+        r#type: DatasetType,
         properties: HashMap<String, PropertyValue>,
     },
     SetProperties {
@@ -83,12 +86,24 @@ impl ActionSet {
         self.additive
             .iter()
             .flat_map(|action| match action {
-                ZfsAction::CreateDataset { name, properties } => {
+                ZfsAction::CreateDataset {
+                    name,
+                    r#type,
+                    properties,
+                } => {
                     let mut output = Vec::with_capacity(3 + properties.len());
                     output.extend_from_slice(&["zfs", "create"].map(ToOwned::to_owned));
+                    if *r#type == DatasetType::Volume
+                        && let Some(volsize) = properties.get("volsize")
+                    {
+                        output.extend(["-V".to_owned(), volsize.to_string()]);
+                    }
                     output.extend(
                         properties
                             .iter()
+                            .filter(|(name, _)| {
+                                *r#type == DatasetType::FileSystem || name.as_str() != "volsize"
+                            })
                             .map(|(name, value)| format!("-o{}={}", name, value.to_string())),
                     );
                     output.push(name.to_owned());
@@ -147,17 +162,25 @@ impl VecActionProducer {
     }
 
     fn cleanup_multiple_creates(actions: Vec<ZfsAction>) -> Vec<ZfsAction> {
-        let mut known_datasets: HashMap<String, HashMap<String, PropertyValue>> = HashMap::new();
+        let mut known_datasets: HashMap<String, (DatasetType, HashMap<String, PropertyValue>)> =
+            HashMap::new();
 
         actions
             .into_iter()
             .flat_map::<Box<[ZfsAction]>, _>(|action| match &action {
-                ZfsAction::CreateDataset { name, properties } => {
+                ZfsAction::CreateDataset {
+                    name,
+                    r#type,
+                    properties,
+                } => {
                     log::trace!("optimizing {:?}", action);
                     let mut edited_properties = HashMap::new();
 
-                    if let Some(existing_properties) = known_datasets.get(name) {
+                    if let Some((existing_type, existing_properties)) = known_datasets.get(name) {
                         log::trace!("known dateset {}", name);
+                        if existing_type != r#type {
+                            return [action].into_iter().collect();
+                        }
                         for (name, value) in properties {
                             if let Some(existing_value) = existing_properties.get(name) {
                                 if existing_value != value {
@@ -202,7 +225,7 @@ impl VecActionProducer {
                         }
                     } else {
                         log::trace!("new dateset {}, keeping", name);
-                        known_datasets.insert(name.clone(), properties.clone());
+                        known_datasets.insert(name.clone(), (*r#type, properties.clone()));
                         [action].into_iter().collect()
                     }
                 }
@@ -273,6 +296,7 @@ where
                 (
                     k,
                     ZfsSpecificationDataset::new(
+                        v.r#type,
                         filter_by_pats!(
                             v.properties.into_iter(),
                             ignored_properties.unwrap_or(&spec.ignored_properties)
@@ -294,6 +318,22 @@ where
     );
     let desired = filter_spec(desired, None, None);
 
+    for (name, dataset) in &desired.datasets {
+        if dataset.r#type == DatasetType::Volume {
+            let child_prefix = format!("{name}/");
+            if desired
+                .datasets
+                .keys()
+                .any(|candidate| candidate.starts_with(&child_prefix))
+            {
+                action_producer.produce_error(format!(
+                    "cannot create volume dataset {name} because it has child datasets"
+                ));
+                return;
+            }
+        }
+    }
+
     let mut desired_datasets = desired.datasets.iter().collect::<Vec<_>>();
     desired_datasets.sort_by_key(|(key, _)| key.len());
 
@@ -306,6 +346,7 @@ where
                     log::trace!("create parent dataset {}", dataset_part);
                     action_producer.produce_action(ZfsAction::CreateDataset {
                         name: dataset_part.to_owned(),
+                        r#type: DatasetType::FileSystem,
                         properties: HashMap::new(),
                     })
                 }
@@ -320,8 +361,17 @@ where
                     .collect::<Vec<_>>()
                     .join(" ")
             );
+            if desired_dataset.r#type == DatasetType::Volume
+                && desired_dataset.get_property("volsize").is_none()
+            {
+                action_producer.produce_error(format!(
+                    "cannot create volume dataset {dataset_name} without volsize"
+                ));
+                continue;
+            }
             action_producer.produce_action(ZfsAction::CreateDataset {
                 name: dataset_name.to_owned(),
+                r#type: desired_dataset.r#type,
                 properties: desired_dataset
                     .properties
                     .iter()
@@ -332,6 +382,14 @@ where
         };
 
         log::trace!("dataset {} already exists", dataset_name);
+
+        if actual_dataset.r#type != desired_dataset.r#type {
+            action_producer.produce_error(format!(
+                "cannot change dataset {dataset_name} from {:?} to {:?}",
+                actual_dataset.r#type, desired_dataset.r#type
+            ));
+            continue;
+        }
 
         let mut properties = HashMap::new();
 
@@ -350,6 +408,16 @@ where
                 continue;
             };
 
+            if actual_property.value == desired_property.value {
+                log::trace!(
+                    "dataset {} property {} already set to {}, skip",
+                    dataset_name,
+                    desired_property_name,
+                    desired_property.value.to_string()
+                );
+                continue;
+            }
+
             if !actual_property
                 .source
                 .as_ref()
@@ -365,16 +433,6 @@ where
                     "cannot set property {} of dataset {} because source is {:?}",
                     desired_property_name, dataset_name, actual_property.source
                 ));
-                continue;
-            }
-
-            if actual_property.value == desired_property.value {
-                log::trace!(
-                    "dataset {} property {} already set to {}, skip",
-                    dataset_name,
-                    desired_property_name,
-                    desired_property.value.to_string()
-                );
                 continue;
             }
 
@@ -411,11 +469,24 @@ where
                 let mut inherited_properties: Vec<String> = Vec::new();
 
                 for (property_name, actual_property) in &actual_dataset.properties {
+                    let is_auto = actual_dataset.r#type == DatasetType::Volume
+                        && match (property_name.as_str(), &actual_property.value) {
+                            ("volsize", _) => true,
+                            // `refreservation` cannot be inherited on volumes, so never
+                            // generate an inherit command for it.
+                            ("refreservation", _) => true,
+                            ("reservation", PropertyValue::Number(0)) => true,
+                            ("reservation", PropertyValue::String(value)) => {
+                                matches!(value.as_str(), "auto" | "none" | "0")
+                            }
+                            _ => false,
+                        };
                     if actual_property
                         .source
                         .as_ref()
                         .map_or(false, |source| source.is_local())
                         && desired_dataset.properties.get(property_name).is_none()
+                        && !is_auto
                     {
                         log::trace!(
                             "dataset {} inherit property {}",
@@ -497,6 +568,13 @@ fn get_actions(
         ZfsSpecification::from_reader(file).map_err(ZfsDiskoError::InvalidSpec)?
     };
 
+    get_actions_for_specification(zfs_specification, zfs_list_output)
+}
+
+fn get_actions_for_specification(
+    zfs_specification: ZfsSpecification,
+    zfs_list_output: ZfsList,
+) -> Result<ActionSet, ZfsDiskoError> {
     let mut ap = VecActionProducer::new();
 
     eval_spec(
@@ -507,11 +585,234 @@ fn get_actions(
 
     let (actions, errors) = ap.finalize();
 
-    for error in errors {
-        log::error!("{}", error)
+    if !errors.is_empty() {
+        return Err(ZfsDiskoError::InvalidPlan(errors.join("\n")));
     }
 
     Ok(actions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn actual(json: &str) -> ZfsList {
+        ZfsList::from_reader(json.as_bytes()).unwrap()
+    }
+
+    fn desired(json: &str) -> ZfsSpecification {
+        ZfsSpecification::from_reader(json.as_bytes()).unwrap()
+    }
+
+    fn empty_actual() -> ZfsList {
+        actual(
+            r#"{
+                "output_version": { "command": "zfs get", "vers_major": 0, "vers_minor": 1 },
+                "datasets": {}
+            }"#,
+        )
+    }
+
+    fn volume_actual(properties: &str, dataset_type: &str) -> ZfsList {
+        actual(&format!(
+            r#"{{
+                "output_version": {{ "command": "zfs get", "vers_major": 0, "vers_minor": 1 }},
+                "datasets": {{
+                    "zroot": {{
+                        "name": "zroot",
+                        "type": "FILESYSTEM",
+                        "pool": "zroot",
+                        "createtxg": 1,
+                        "properties": {{}}
+                    }},
+                    "zroot/volume": {{
+                        "name": "zroot/volume",
+                        "type": "{dataset_type}",
+                        "pool": "zroot",
+                        "createtxg": 1,
+                        "properties": {properties}
+                    }}
+                }}
+            }}"#
+        ))
+    }
+
+    #[test]
+    fn creates_volumes_with_volsize_as_a_creation_argument() {
+        let actions = get_actions_for_specification(
+            desired(
+                r#"{
+                    "datasets": {
+                        "zroot/volume": {
+                            "type": "Volume",
+                            "properties": {
+                                "volsize": "10M",
+                                "volblocksize": 4096,
+                                "compression": "zle"
+                            }
+                        }
+                    },
+                    "ignored_datasets": [],
+                    "ignored_properties": []
+                }"#,
+            ),
+            empty_actual(),
+        )
+        .unwrap();
+
+        let command = actions
+            .to_additive_commands()
+            .into_iter()
+            .find(|command| command.last() == Some(&"zroot/volume".to_owned()))
+            .unwrap();
+        assert_eq!(&command[..4], ["zfs", "create", "-V", "10M"]);
+        assert!(command.contains(&"-ovolblocksize=4096".to_owned()));
+        assert!(command.contains(&"-ocompression=zle".to_owned()));
+        assert!(
+            !command
+                .iter()
+                .any(|argument| argument.starts_with("-ovolsize="))
+        );
+    }
+
+    #[test]
+    fn existing_volume_without_declared_size_is_unchanged() {
+        let actions = get_actions_for_specification(
+            desired(
+                r#"{
+                    "datasets": { "zroot/volume": { "type": "Volume", "properties": {} } },
+                    "ignored_datasets": [],
+                    "ignored_properties": []
+                }"#,
+            ),
+            volume_actual(
+                r#"{
+                    "volsize": { "value": 10485760, "source": { "type": "LOCAL", "data": "-" } },
+                    "refreservation": { "value": 10485760, "source": { "type": "LOCAL", "data": "-" } },
+                    "reservation": { "value": 0, "source": { "type": "LOCAL", "data": "-" } }
+                }"#,
+                "ZVOL",
+            ),
+        )
+        .unwrap();
+
+        assert!(actions.to_additive_commands().is_empty());
+    }
+
+    #[test]
+    fn explicit_refreservation_is_reconciled_while_automatic_refreservation_is_preserved() {
+        let actual = volume_actual(
+            r#"{
+                "volsize": { "value": 10485760, "source": { "type": "LOCAL", "data": "-" } },
+                "refreservation": { "value": "auto", "source": { "type": "LOCAL", "data": "-" } }
+            }"#,
+            "ZVOL",
+        );
+        let actions = get_actions_for_specification(
+            desired(
+                r#"{
+                    "datasets": {
+                        "zroot/volume": {
+                            "type": "Volume",
+                            "properties": { "refreservation": "none" }
+                        }
+                    },
+                    "ignored_datasets": [],
+                    "ignored_properties": []
+                }"#,
+            ),
+            actual,
+        )
+        .unwrap();
+
+        assert!(actions.to_additive_commands().contains(&vec![
+            "zfs".to_owned(),
+            "set".to_owned(),
+            "refreservation=none".to_owned(),
+            "zroot/volume".to_owned(),
+        ]));
+    }
+
+    #[test]
+    fn rejects_volumes_without_size_when_creation_is_required() {
+        let error = get_actions_for_specification(
+            desired(
+                r#"{
+                    "datasets": { "zroot/volume": { "type": "Volume", "properties": {} } },
+                    "ignored_datasets": [],
+                    "ignored_properties": []
+                }"#,
+            ),
+            empty_actual(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("zroot/volume"));
+        assert!(error.to_string().contains("volsize"));
+    }
+
+    #[test]
+    fn rejects_type_conversions_and_children_of_volumes() {
+        let type_error = get_actions_for_specification(
+            desired(
+                r#"{
+                    "datasets": {
+                        "zroot/volume": {
+                            "type": "Volume",
+                            "properties": { "volsize": "10M" }
+                        }
+                    },
+                    "ignored_datasets": [],
+                    "ignored_properties": []
+                }"#,
+            ),
+            volume_actual(r#"{}"#, "FILESYSTEM"),
+        )
+        .unwrap_err();
+        assert!(type_error.to_string().contains("zroot/volume"));
+
+        let child_error = get_actions_for_specification(
+            desired(
+                r#"{
+                    "datasets": {
+                        "zroot/volume": {
+                            "type": "Volume",
+                            "properties": { "volsize": "10M" }
+                        },
+                        "zroot/volume/child": { "properties": {} }
+                    },
+                    "ignored_datasets": [],
+                    "ignored_properties": []
+                }"#,
+            ),
+            empty_actual(),
+        )
+        .unwrap_err();
+        assert!(child_error.to_string().contains("zroot/volume"));
+        assert!(child_error.to_string().contains("child datasets"));
+    }
+
+    #[test]
+    fn datasets_without_a_type_remain_filesystems() {
+        let actions = get_actions_for_specification(
+            desired(
+                r#"{
+                    "datasets": { "zroot/filesystem": { "properties": {} } },
+                    "ignored_datasets": [],
+                    "ignored_properties": []
+                }"#,
+            ),
+            empty_actual(),
+        )
+        .unwrap();
+
+        let command = actions
+            .to_additive_commands()
+            .into_iter()
+            .find(|command| command.last() == Some(&"zroot/filesystem".to_owned()))
+            .unwrap();
+        assert_eq!(command, vec!["zfs", "create", "zroot/filesystem"]);
+    }
 }
 
 fn main() -> Result<(), ZfsDiskoError> {
@@ -641,7 +942,7 @@ fn main() -> Result<(), ZfsDiskoError> {
 }
 
 #[cfg(test)]
-mod tests {
+mod command_tests {
     use super::*;
 
     fn commands(additive: Vec<ZfsAction>) -> Vec<Vec<String>> {
@@ -695,6 +996,7 @@ mod tests {
             commands(vec![
                 ZfsAction::CreateDataset {
                     name: "tank/new".to_owned(),
+                    r#type: DatasetType::FileSystem,
                     properties: create_properties,
                 },
                 ZfsAction::SetProperties {
