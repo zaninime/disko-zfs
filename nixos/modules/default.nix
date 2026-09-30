@@ -70,7 +70,7 @@ in
       };
 
       datasets = lib.mkOption {
-        type = lib.types.lazyAttrsOf (
+        type = lib.types.lazyAttrsOf
           (lib.types.submodule {
             options.properties = lib.mkOption {
               type = lib.types.attrsOf (lib.types.either lib.types.int lib.types.str);
@@ -79,8 +79,7 @@ in
                 Properties that this dataset should have.
               '';
             };
-          })
-        );
+          });
         description = ''
           Declaration of datasets that should exist on this system.
         '';
@@ -140,13 +139,24 @@ in
           (lib.map (
             { name, value }:
             lib.mapAttrsToList (
-              dataset: settings: lib.nameValuePair "${name}/${dataset}" { properties = settings.options; }
+              dataset: settings:
+              lib.nameValuePair "${name}/${dataset}" {
+                properties =
+                  (lib.optionalAttrs ((settings.mountpoint or null) != null) {
+                    mountpoint = settings.mountpoint;
+                  })
+                  // settings.options;
+              }
             ) (lib.filterAttrs (name: _: name != "__root") value)
             ++ [
               {
                 inherit name;
                 value = {
-                  properties = value.__root.options;
+                  properties =
+                    (lib.optionalAttrs ((value.__root.mountpoint or null) != null) {
+                      mountpoint = value.__root.mountpoint;
+                    })
+                    // value.__root.options;
                 };
               }
             ]
