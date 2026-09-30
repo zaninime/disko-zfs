@@ -1,0 +1,10 @@
+{
+  "datasets": {
+    "zroot/volume": {
+      "type": "Volume",
+      "properties": {}
+    }
+  },
+  "ignored_datasets": [],
+  "ignored_properties": []
+}
