@@ -82,7 +82,7 @@ impl ActionSet {
     pub fn to_additive_commands(&self) -> Vec<Vec<String>> {
         self.additive
             .iter()
-            .map(|action| match action {
+            .flat_map(|action| match action {
                 ZfsAction::CreateDataset { name, properties } => {
                     let mut output = Vec::with_capacity(3 + properties.len());
                     output.extend_from_slice(&["zfs", "create"].map(ToOwned::to_owned));
@@ -92,7 +92,7 @@ impl ActionSet {
                             .map(|(name, value)| format!("-o{}={}", name, value.to_string())),
                     );
                     output.push(name.to_owned());
-                    output
+                    vec![output]
                 }
                 ZfsAction::SetProperties {
                     dataset,
@@ -105,16 +105,25 @@ impl ActionSet {
                             .map(|(name, value)| format!("{}={}", name, value.to_string())),
                     );
                     vec.push(dataset.to_owned());
-                    vec
+                    vec![vec]
                 }
                 ZfsAction::InheritProperties {
                     dataset,
                     properties,
                 } => {
-                    let mut vec = Vec::from(["zfs", "inherit"].map(ToOwned::to_owned));
-                    vec.extend(properties.into_iter().map(|s| s.clone()));
-                    vec.push(dataset.to_owned());
-                    vec
+                    let mut properties = properties.clone();
+                    properties.sort();
+                    properties
+                        .into_iter()
+                        .map(|property| {
+                            vec![
+                                "zfs".to_owned(),
+                                "inherit".to_owned(),
+                                property,
+                                dataset.to_owned(),
+                            ]
+                        })
+                        .collect()
                 }
             })
             .collect()
@@ -393,7 +402,10 @@ where
         }
     }
 
-    for (dataset_name, actual_dataset) in &actual.datasets {
+    let mut actual_datasets = actual.datasets.iter().collect::<Vec<_>>();
+    actual_datasets.sort_by_key(|(dataset_name, _)| *dataset_name);
+
+    for (dataset_name, actual_dataset) in actual_datasets {
         match desired.datasets.get(dataset_name) {
             Some(desired_dataset) => {
                 let mut inherited_properties: Vec<String> = Vec::new();
@@ -625,5 +637,75 @@ fn main() -> Result<(), ZfsDiskoError> {
 
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn commands(additive: Vec<ZfsAction>) -> Vec<Vec<String>> {
+        ActionSet {
+            additive,
+            destrictive: Vec::new(),
+        }
+        .to_additive_commands()
+    }
+
+    fn command(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    #[test]
+    fn inherit_with_no_properties_generates_no_commands() {
+        assert!(
+            commands(vec![ZfsAction::InheritProperties {
+                dataset: "tank/backups".to_owned(),
+                properties: Vec::new(),
+            }])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn inherit_with_multiple_properties_generates_sorted_commands() {
+        assert_eq!(
+            commands(vec![ZfsAction::InheritProperties {
+                dataset: "tank/backups".to_owned(),
+                properties: vec!["xattr".to_owned(), "atime".to_owned(), "acltype".to_owned()],
+            }]),
+            vec![
+                command(&["zfs", "inherit", "acltype", "tank/backups"]),
+                command(&["zfs", "inherit", "atime", "tank/backups"]),
+                command(&["zfs", "inherit", "xattr", "tank/backups"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn create_and_set_commands_keep_their_existing_shapes() {
+        let create_properties =
+            HashMap::from([("atime".to_owned(), PropertyValue::String("off".to_owned()))]);
+        let set_properties = HashMap::from([(
+            "recordsize".to_owned(),
+            PropertyValue::String("8K".to_owned()),
+        )]);
+
+        assert_eq!(
+            commands(vec![
+                ZfsAction::CreateDataset {
+                    name: "tank/new".to_owned(),
+                    properties: create_properties,
+                },
+                ZfsAction::SetProperties {
+                    dataset: "tank/existing".to_owned(),
+                    properties: set_properties,
+                },
+            ]),
+            vec![
+                command(&["zfs", "create", "-oatime=off", "tank/new"]),
+                command(&["zfs", "set", "recordsize=8K", "tank/existing"]),
+            ]
+        );
     }
 }
