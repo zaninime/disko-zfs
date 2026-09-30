@@ -70,17 +70,24 @@ in
       };
 
       datasets = lib.mkOption {
-        type = lib.types.lazyAttrsOf (
-          (lib.types.submodule {
-            options.properties = lib.mkOption {
-              type = lib.types.attrsOf (lib.types.either lib.types.int lib.types.str);
-              default = { };
-              description = ''
-                Properties that this dataset should have.
-              '';
+        type = lib.types.lazyAttrsOf (lib.types.submodule {
+            options = {
+              type = lib.mkOption {
+                type = lib.types.enum [
+                  "Volume"
+                  "FileSystem"
+                ];
+                default = "FileSystem";
+              };
+              properties = lib.mkOption {
+                type = lib.types.attrsOf (lib.types.either lib.types.int lib.types.str);
+                default = { };
+                description = ''
+                  Properties that this dataset should have.
+                '';
+              };
             };
-          })
-        );
+          });
         description = ''
           Declaration of datasets that should exist on this system.
         '';
@@ -140,12 +147,27 @@ in
           (lib.map (
             { name, value }:
             lib.mapAttrsToList (
-              dataset: settings: lib.nameValuePair "${name}/${dataset}" { properties = settings.options; }
+              dataset: settings:
+              lib.nameValuePair "${name}/${dataset}" (
+                if settings.type == "zfs_volume" then
+                  {
+                    type = "Volume";
+                    properties = settings.options // lib.optionalAttrs (settings.size != null) {
+                      volsize = settings.size;
+                    };
+                  }
+                else
+                  {
+                    type = "FileSystem";
+                    properties = settings.options;
+                  }
+              )
             ) (lib.filterAttrs (name: _: name != "__root") value)
             ++ [
               {
                 inherit name;
                 value = {
+                  type = "FileSystem";
                   properties = value.__root.options;
                 };
               }

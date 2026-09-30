@@ -77,6 +77,8 @@ Now, when you switch your machine to this configuration, `disko-zfs` will ensure
 
 If you also utilize [Disko](https://github.com/nix-community/disko) in your NixOS configuration, `disko-zfs` will detect this and automatically include ZFS pools and datasets declared through Disko in its own configuration. As such if you have Disko, you should prefer Disko's way of declaring ZFS datasets and pools. See the [ZFS Disko example](https://github.com/nix-community/disko/blob/master/example/zfs.nix) to get an idea of how to do this.
 
+Disko `zfs_volume` datasets are translated to ZFS volumes. A non-null Disko `size` becomes `volsize` and takes precedence over `options.volsize`. `disko-zfs` does not translate volume `extraArgs` such as sparse-volume flags or format `content`; configure those outside this module.
+
 ## Dry Running `disko-zfs`
 
 As a specialty `disko-zfs` adds an activation script which only executes during dry activation, which will print out the command `disko-zfs` would run if you were to switch to that NixOS configuration. As such if you run:

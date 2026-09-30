@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize, de::Visitor};
 
+#[derive(Deserialize, Debug, Serialize, Clone, PartialEq, Eq, Copy, Default)]
+pub enum DatasetType {
+    #[serde(alias = "FILESYSTEM")]
+    #[default]
+    FileSystem,
+    #[serde(alias = "VOLUME", alias = "ZVOL")]
+    Volume,
+}
+
 #[derive(Eq, Hash, PartialEq, Deserialize, Serialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum PropertySource {
